@@ -13,7 +13,6 @@ import 'package:fl_clash/enum/enum.dart';
 import 'package:fl_clash/models/models.dart';
 import 'package:fl_clash/providers/providers.dart';
 import 'package:fl_clash/state.dart';
-import 'package:fl_clash/views/disclaimer.dart';
 import 'package:fl_clash/views/navigation.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter/services.dart';
@@ -170,9 +169,7 @@ class Bootstrap {
       unawaited(window?.hide());
     }
     await _handleFailedPreference();
-    if (!await _handlerDisclaimer()) {
-      return;
-    }
+    _handlerDisclaimer();
     await _showCrashRecoveryTip();
     if (_resetMixedPort case final value?) {
       dialogs.showMixedPortReset(
@@ -235,26 +232,12 @@ class Bootstrap {
     await _container.read(systemActionProvider.notifier).handleExit(false);
   }
 
-  /// Unattended desktop installs, such as a container nobody watches, accept
-  /// up front: the core only starts after the disclaimer is accepted.
-  bool get _isDisclaimerAcceptedByEnvironment =>
-      system.isDesktop &&
-      Platform.environment['FLCLASH_ACCEPT_DISCLAIMER'] == '1';
-
-  /// Android's exit only finishes the activity, so Dart keeps running after
-  /// [SystemAction.handleExit] returns and must not go on to start the app.
-  Future<bool> _handlerDisclaimer() async {
+  void _handlerDisclaimer() {
     final acceptedVersion = _container.read(
       appSettingProvider.select((state) => state.acceptedDisclaimerVersion),
     );
     if (acceptedVersion >= disclaimerVersion) {
-      return true;
-    }
-    final isDisclaimerAccepted =
-        _isDisclaimerAcceptedByEnvironment || await requestDisclaimerConsent();
-    if (!isDisclaimerAccepted) {
-      await _container.read(systemActionProvider.notifier).handleExit();
-      return false;
+      return;
     }
     _container
         .read(appSettingProvider.notifier)
@@ -262,7 +245,6 @@ class Bootstrap {
           (state) =>
               state.copyWith(acceptedDisclaimerVersion: disclaimerVersion),
         );
-    return true;
   }
 }
 

@@ -512,7 +512,8 @@ class AppPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware 
 
     private fun installStatusIntent(sessionId: Int): PendingIntent {
         val application = GlobalState.application
-        val intent = Intent(INSTALL_STATUS_ACTION).setPackage(application.packageName)
+        val intent = Intent(installStatusAction(application.packageName))
+            .setPackage(application.packageName)
         // The installer writes the status into the intent's extras.
         val mutable = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             PendingIntent.FLAG_MUTABLE
@@ -760,7 +761,7 @@ class AppPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware 
             }
         flutterPluginBinding.applicationContext.registerReceiverCompat(
             installStatusReceiver,
-            IntentFilter(INSTALL_STATUS_ACTION),
+            IntentFilter(installStatusAction(flutterPluginBinding.applicationContext.packageName)),
         )
     }
 
@@ -892,6 +893,7 @@ class AppPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware 
         const val NOTIFICATION_PERMISSION_REQUEST_CODE = 1002
         const val INSTALLED_APPS_PERMISSION_REQUEST_CODE = 1003
         const val LOCAL_NETWORK_PERMISSION_REQUEST_CODE = 1004
-        const val INSTALL_STATUS_ACTION = "${Components.PACKAGE_NAME}.action.INSTALL_STATUS"
+
+        fun installStatusAction(packageName: String) = "$packageName.action.INSTALL_STATUS"
     }
 }

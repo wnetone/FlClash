@@ -1,0 +1,245 @@
+name: Android Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build and publish (e.g. v0.9.4)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: '3.50.0'
+  GO_VERSION: '1.27.1'
+  NDK_VERSION: r28c
+
+jobs:
+  android-release:
+    name: Build, Sign & Release Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Resolve release version
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$INPUT_TAG" ]]; then
+            TAG="$INPUT_TAG"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            base="$(sed -n 's/^version: \([0-9]*\.[0-9]*\.[0-9]*\).*/\1/p' pubspec.yaml)"
+            TAG="v${base}"
+          fi
+
+          if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-pre\.[0-9]+(\+[0-9]+)?)?$ ]]; then
+            echo "::error::Invalid release tag: $TAG"
+            exit 1
+          fi
+          name="${BASH_REMATCH[1]}"
+          committed="$(sed -n 's/^version: .*+\([0-9]*\)$/\1/p' pubspec.yaml)"
+          build="$(date -u +%Y%m%d%H)"
+          if (( build <= ${committed:-0} )); then
+            build=$((committed + 1))
+          fi
+
+          version_full="${name}+${build}"
+          sed -i "s/^version: .*/version: ${version_full}/" pubspec.yaml
+
+          {
+            echo "tag=${TAG}"
+            echo "version_name=${name}"
+            echo "version_full=${version_full}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved release: tag=${TAG}, version=${version_full}"
+
+      - name: Setup Android signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for var in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!var}" ]]; then
+              echo "::error::Missing required secret: $var"
+              exit 1
+            fi
+          done
+
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d '\r\n ' | base64 --decode > android/app/keystore.jks
+          test -s android/app/keystore.jks || { echo "::error::Decoded keystore is empty"; exit 1; }
+
+          {
+            printf 'keyAlias=%s\n' "$ANDROID_KEY_ALIAS"
+            printf 'storePassword=%s\n' "$ANDROID_KEYSTORE_PASSWORD"
+            printf 'keyPassword=%s\n' "$ANDROID_KEY_PASSWORD"
+          } >> android/local.properties
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: false
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: build-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+          link-to-sdk: true
+
+      - name: Get Flutter dependencies
+        run: |
+          flutter --version
+          flutter pub get
+
+      - name: Fetch CA certificates
+        env:
+          CA_BUNDLE: cacert-2026-09-25.pem
+          CA_BUNDLE_SHA256: a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505
+        run: |
+          set -euo pipefail
+          bundle=core/Clash.Meta/component/ca/ca-certificates.crt
+          curl -fsSL --retry 3 -o "$bundle" "https://curl.se/ca/$CA_BUNDLE"
+          echo "$CA_BUNDLE_SHA256  $bundle" | sha256sum -c -
+
+      - name: Build Android release APKs
+        env:
+          ANDROID_NDK_HOME: ${{ steps.build-ndk.outputs.ndk-path }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          dart tool/package.dart android \
+            --arch arm64 \
+            --arch armv7 \
+            --arch amd64 \
+            --arch universal \
+            --tag "$RELEASE_TAG" \
+            --env stable \
+            -v
+
+      - name: Re-sign and verify APKs (v1 + v2 + v3)
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          VERSION_NAME: ${{ steps.meta.outputs.version_name }}
+        run: |
+          set -euo pipefail
+          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK_DIR" || { echo "::error::ANDROID_HOME is not set"; exit 1; }
+          BUILD_TOOLS_VER="$(ls -1 "$SDK_DIR/build-tools" | sort -V | tail -n 1)"
+          BUILD_TOOLS_DIR="$SDK_DIR/build-tools/$BUILD_TOOLS_VER"
+          APKSIGNER="$BUILD_TOOLS_DIR/apksigner"
+          AAPT2="$BUILD_TOOLS_DIR/aapt2"
+          test -x "$APKSIGNER" || { echo "::error::apksigner not found in $BUILD_TOOLS_DIR"; exit 1; }
+          echo "Using build-tools: $BUILD_TOOLS_DIR"
+
+          shopt -s nullglob
+          apks=(dist/*.apk)
+          if (( ${#apks[@]} == 0 )); then
+            echo "::error::No APK files found in dist/"
+            exit 1
+          fi
+
+          for apk in "${apks[@]}"; do
+            echo "========================================"
+            echo "Re-signing: $apk"
+            "$APKSIGNER" sign \
+              --ks android/app/keystore.jks \
+              --ks-key-alias "$ANDROID_KEY_ALIAS" \
+              --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+              --key-pass env:ANDROID_KEY_PASSWORD \
+              --min-sdk-version 21 \
+              --v1-signing-enabled true \
+              --v2-signing-enabled true \
+              --v3-signing-enabled true \
+              "$apk"
+
+            echo "Verifying: $apk"
+            verify_output="$("$APKSIGNER" verify --verbose --min-sdk-version 21 "$apk" 2>&1)"
+            echo "$verify_output"
+
+            grep -qE '^Verified using v1 scheme \(JAR signing\): true$' <<< "$verify_output" || {
+              echo "::error::v1 signing verification failed for $apk"
+              exit 1
+            }
+            grep -qE '^Verified using v2 scheme \(APK Signature Scheme v2\): true$' <<< "$verify_output" || {
+              echo "::error::v2 signing verification failed for $apk"
+              exit 1
+            }
+            grep -qE '^Verified using v3 scheme \(APK Signature Scheme v3\): true$' <<< "$verify_output" || {
+              echo "::error::v3 signing verification failed for $apk"
+              exit 1
+            }
+
+            rsa_entries="$(unzip -Z1 "$apk" | grep -E '^META-INF/[^/]+\.RSA$' || true)"
+            if [[ -z "$rsa_entries" ]]; then
+              echo "::error::META-INF/*.RSA not found in $apk"
+              exit 1
+            fi
+            echo "META-INF RSA signature entry: $rsa_entries"
+
+            if [[ -x "$AAPT2" ]]; then
+              "$AAPT2" dump badging "$apk" | grep -E '^(package:|application-label:)' || true
+            fi
+          done
+
+          rm -f dist/manifest.json
+          (
+            cd dist
+            sha256sum FlClash-*.apk > "FlClash-${VERSION_NAME}-SHA256SUMS"
+          )
+          echo "Generated checksums:"
+          cat "dist/FlClash-${VERSION_NAME}-SHA256SUMS"
+
+      - name: Cleanup signing material
+        if: always()
+        run: rm -f android/app/keystore.jks android/local.properties
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: FlClash ${{ steps.meta.outputs.tag }}
+          make_latest: true
+          generate_release_notes: true
+          files: |
+            dist/*.apk
+            dist/*-SHA256SUMS
