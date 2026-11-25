@@ -1,0 +1,147 @@
+name: Sync Upstream Release
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: chen08209/FlClash
+
+jobs:
+  sync:
+    name: Check & Sync Upstream Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.WNETONE_APP_ID }}
+          private-key: ${{ secrets.WNETONE_APP_PRIVATE_KEY }}
+
+      - name: Check upstream latest stable release
+        id: check
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          upstream_json="$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest")"
+
+          tag="$(jq -r '.tag_name // empty' <<< "$upstream_json")"
+          draft="$(jq -r '.draft' <<< "$upstream_json")"
+          prerelease="$(jq -r '.prerelease' <<< "$upstream_json")"
+
+          echo "Upstream latest release: tag=${tag}, draft=${draft}, prerelease=${prerelease}"
+
+          if [[ "$draft" != "false" || "$prerelease" != "false" ]]; then
+            echo "Latest upstream release is not a stable release; skipping."
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Skipping non-semver tag: $tag"
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          status="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
+
+          if [[ "$status" == "200" ]]; then
+            echo "Release ${tag} already exists in ${GITHUB_REPOSITORY}; nothing to do."
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$status" != "404" ]]; then
+            echo "::error::Unexpected HTTP status ${status} when checking ${GITHUB_REPOSITORY} release ${tag}"
+            exit 1
+          fi
+
+          echo "New upstream stable release detected: ${tag}"
+          {
+            echo "needs_sync=true"
+            echo "upstream_tag=${tag}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        if: steps.check.outputs.needs_sync == 'true'
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+          ref: main
+
+      - name: Replay fork customizations onto upstream release tag
+        if: steps.check.outputs.needs_sync == 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.check.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "wnetone"
+          git config user.email "contact@wnet.one"
+
+          commits=()
+          cur="$(git rev-parse HEAD)"
+          while true; do
+            email="$(git log -1 --format=%ae "$cur")"
+            if [[ "$email" != "contact@wnet.one" ]]; then
+              break
+            fi
+            commits=("$cur" "${commits[@]}")
+            parent="$(git rev-parse "${cur}^" 2>/dev/null || true)"
+            [[ -n "$parent" ]] || break
+            cur="$parent"
+          done
+
+          if (( ${#commits[@]} == 0 )); then
+            echo "::error::No wnetone customization commits found at HEAD of main"
+            exit 1
+          fi
+
+          echo "Fork customization commits to replay:"
+          for c in "${commits[@]}"; do
+            git log -1 --oneline "$c"
+          done
+
+          git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
+            "refs/tags/${UPSTREAM_TAG}:refs/tags/upstream-${UPSTREAM_TAG}"
+          git checkout -B "sync-${UPSTREAM_TAG}" "refs/tags/upstream-${UPSTREAM_TAG}"
+
+          for c in "${commits[@]}"; do
+            GIT_COMMITTER_NAME="wnetone" GIT_COMMITTER_EMAIL="contact@wnet.one" \
+              git cherry-pick "$c"
+          done
+
+          grep -q 'applicationId = "com.follow.wnet.clash"' android/app/build.gradle.kts || {
+            echo "::error::Missing customized applicationId after replay"
+            exit 1
+          }
+          grep -q "const repository = 'wnetone/FlClash';" lib/common/constant.dart || {
+            echo "::error::Missing customized repository constant after replay"
+            exit 1
+          }
+          test -f .github/workflows/android-release.yml || {
+            echo "::error::Missing android-release.yml after replay"
+            exit 1
+          }
+          test -f .github/workflows/sync-upstream.yml || {
+            echo "::error::Missing sync-upstream.yml after replay"
+            exit 1
+          }
+
+          git push --force origin "HEAD:refs/heads/main"
+          git tag -f "$UPSTREAM_TAG" HEAD
+          git push --force origin "refs/tags/${UPSTREAM_TAG}"
+          echo "Synced ${UPSTREAM_TAG} and pushed tag to trigger Android Release."
