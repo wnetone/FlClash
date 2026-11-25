@@ -1,4 +1,4 @@
-name: Android Release
+name: Release
 
 on:
   push:
@@ -22,17 +22,23 @@ env:
   FLUTTER_VERSION: '3.50.0'
   GO_VERSION: '1.27.1'
   NDK_VERSION: r28c
+  CA_BUNDLE: cacert-2026-09-25.pem
+  CA_BUNDLE_SHA256: a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505
 
 jobs:
-  android-release:
-    name: Build, Sign & Release Android APK
+  meta:
+    name: Resolve Release Version
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version_name: ${{ steps.meta.outputs.version_name }}
+      version_full: ${{ steps.meta.outputs.version_full }}
     steps:
-      - name: Checkout
+      - name: Checkout pubspec.yaml
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          submodules: recursive
+          sparse-checkout: pubspec.yaml
+          sparse-checkout-cone-mode: false
 
       - name: Resolve release version
         id: meta
@@ -61,14 +67,31 @@ jobs:
           fi
 
           version_full="${name}+${build}"
-          sed -i "s/^version: .*/version: ${version_full}/" pubspec.yaml
-
           {
             echo "tag=${TAG}"
             echo "version_name=${name}"
             echo "version_full=${version_full}"
           } >> "$GITHUB_OUTPUT"
           echo "Resolved release: tag=${TAG}, version=${version_full}"
+
+  android:
+    name: Build & Sign Android APKs
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Apply release version
+        env:
+          VERSION_FULL: ${{ needs.meta.outputs.version_full }}
+        run: |
+          set -euo pipefail
+          sed "s/^version: .*/version: ${VERSION_FULL}/" pubspec.yaml > pubspec.yaml.tmp
+          mv pubspec.yaml.tmp pubspec.yaml
 
       - name: Setup Android signing
         env:
@@ -130,9 +153,6 @@ jobs:
           flutter pub get
 
       - name: Fetch CA certificates
-        env:
-          CA_BUNDLE: cacert-2026-09-25.pem
-          CA_BUNDLE_SHA256: a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505
         run: |
           set -euo pipefail
           bundle=core/Clash.Meta/component/ca/ca-certificates.crt
@@ -142,7 +162,7 @@ jobs:
       - name: Build Android release APKs
         env:
           ANDROID_NDK_HOME: ${{ steps.build-ndk.outputs.ndk-path }}
-          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          RELEASE_TAG: ${{ needs.meta.outputs.tag }}
         run: |
           set -euo pipefail
           dart tool/package.dart android \
@@ -159,7 +179,6 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          VERSION_NAME: ${{ steps.meta.outputs.version_name }}
         run: |
           set -euo pipefail
           SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
@@ -222,24 +241,178 @@ jobs:
           done
 
           rm -f dist/manifest.json
-          (
-            cd dist
-            sha256sum FlClash-*.apk > "FlClash-${VERSION_NAME}-SHA256SUMS"
-          )
-          echo "Generated checksums:"
-          cat "dist/FlClash-${VERSION_NAME}-SHA256SUMS"
+          ls -lh dist/
 
       - name: Cleanup signing material
         if: always()
         run: rm -f android/app/keystore.jks android/local.properties
 
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  desktop:
+    name: Build ${{ matrix.name }}
+    needs: meta
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-amd64
+            platform: windows
+            target: exe
+            os: windows-2022
+            arch: amd64
+          - name: macos-amd64
+            platform: macos
+            target: dmg
+            os: macos-15-intel
+            arch: amd64
+          - name: macos-arm64
+            platform: macos
+            target: dmg
+            os: macos-latest
+            arch: arm64
+          - name: linux-amd64
+            platform: linux
+            target: appimage
+            os: ubuntu-22.04
+            arch: amd64
+    steps:
+      - name: Enable git long paths (Windows)
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: git config --global core.longpaths true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Apply release version
+        shell: bash
+        env:
+          VERSION_FULL: ${{ needs.meta.outputs.version_full }}
+        run: |
+          set -euo pipefail
+          sed "s/^version: .*/version: ${VERSION_FULL}/" pubspec.yaml > pubspec.yaml.tmp
+          mv pubspec.yaml.tmp pubspec.yaml
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: false
+
+      - name: Setup Xcode
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.3.app || sudo xcode-select -s /Applications/Xcode_26.2.app || true
+          xcodebuild -version
+
+      - name: Get Flutter dependencies
+        shell: bash
+        run: |
+          flutter --version
+          flutter pub get
+
+      - name: Fetch CA certificates
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle=core/Clash.Meta/component/ca/ca-certificates.crt
+          curl -fsSL --retry 3 -o "$bundle" "https://curl.se/ca/$CA_BUNDLE"
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "$CA_BUNDLE_SHA256  $bundle" | sha256sum -c -
+          else
+            echo "$CA_BUNDLE_SHA256  $bundle" | shasum -a 256 -c -
+          fi
+
+      - name: Build and package desktop release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.meta.outputs.tag }}
+          FLUTTER_MACOS_ARM64_ONLY: ${{ matrix.platform == 'macos' && matrix.arch == 'arm64' }}
+        run: |
+          set -euo pipefail
+          dart tool/package.dart "${{ matrix.platform }}" \
+            --targets "${{ matrix.target }}" \
+            --tag "$RELEASE_TAG" \
+            --env stable \
+            -v
+          rm -f dist/manifest.json
+          ls -lh dist/
+
+      - name: Upload desktop artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub Release
+    needs: [meta, android, desktop]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify artifacts and generate SHA256SUMS
+        env:
+          VERSION_NAME: ${{ needs.meta.outputs.version_name }}
+        run: |
+          set -euo pipefail
+          expected=(
+            "FlClash-${VERSION_NAME}-android-amd64.apk"
+            "FlClash-${VERSION_NAME}-android-arm64.apk"
+            "FlClash-${VERSION_NAME}-android-armv7.apk"
+            "FlClash-${VERSION_NAME}-android-universal.apk"
+            "FlClash-${VERSION_NAME}-linux-amd64.AppImage"
+            "FlClash-${VERSION_NAME}-macos-amd64.dmg"
+            "FlClash-${VERSION_NAME}-macos-arm64.dmg"
+            "FlClash-${VERSION_NAME}-windows-amd64-setup.exe"
+          )
+
+          for file in "${expected[@]}"; do
+            test -s "dist/${file}" || { echo "::error::Missing expected release artifact: ${file}"; exit 1; }
+          done
+
+          (
+            cd dist
+            sha256sum "${expected[@]}" > "../FlClash-${VERSION_NAME}-SHA256SUMS"
+          )
+          mv "FlClash-${VERSION_NAME}-SHA256SUMS" "dist/FlClash-${VERSION_NAME}-SHA256SUMS"
+          echo "Generated unified SHA256SUMS:"
+          cat "dist/FlClash-${VERSION_NAME}-SHA256SUMS"
+          ls -lh dist/
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: FlClash ${{ steps.meta.outputs.tag }}
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: FlClash ${{ needs.meta.outputs.tag }}
           make_latest: true
           generate_release_notes: true
-          files: |
-            dist/*.apk
-            dist/*-SHA256SUMS
+          files: dist/*
