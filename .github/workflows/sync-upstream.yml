@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  UPSTREAM_REPO: chen08209/FlClash
+  UPSTREAM_REPO: Vialibrex/FlClash
 
 jobs:
   sync:

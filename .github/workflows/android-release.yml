@@ -371,6 +371,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: read
     steps:
       - name: Download all release artifacts
         uses: actions/download-artifact@v4
@@ -382,6 +383,7 @@ jobs:
       - name: Verify artifacts and generate SHA256SUMS
         env:
           VERSION_NAME: ${{ needs.meta.outputs.version_name }}
+          RELEASE_TAG: ${{ needs.meta.outputs.tag }}
         run: |
           set -euo pipefail
           expected=(
@@ -408,11 +410,23 @@ jobs:
           cat "dist/FlClash-${VERSION_NAME}-SHA256SUMS"
           ls -lh dist/
 
+          upstream_body="$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/Vialibrex/FlClash/releases/tags/${RELEASE_TAG}" \
+            | jq -r '.body // empty' || true)"
+          if [[ -n "$upstream_body" ]]; then
+            printf '%s\n' "$upstream_body" | awk '/^<div align=center>/{exit} {print}' > release.md
+          fi
+          if [[ ! -s release.md ]]; then
+            printf 'FlClash %s\n' "$RELEASE_TAG" > release.md
+          fi
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.meta.outputs.tag }}
           name: FlClash ${{ needs.meta.outputs.tag }}
           make_latest: true
-          generate_release_notes: true
+          generate_release_notes: false
+          body_path: release.md
           files: dist/*
